@@ -1,0 +1,31 @@
+name: pointcept-gtx1050ti
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch=2.5.0
+  - torchvision=0.20.0
+  - torchaudio=2.5.0
+  - pytorch-cuda=12.4
+  - ninja
+  - h5py
+  - pyyaml
+  - tensorboard
+  - tensorboardx
+  - wandb
+  - yapf
+  - addict
+  - einops
+  - scipy
+  - plyfile
+  - termcolor
+  - timm
+  - ftfy
+  - regex
+  - tqdm
+  - matplotlib
+  - black

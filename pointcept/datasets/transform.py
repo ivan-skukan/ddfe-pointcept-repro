@@ -19,6 +19,12 @@ from pointcept.utils.registry import Registry
 
 TRANSFORMS = Registry("transforms")
 
+LIDAR_SENSOR_CONFIGS = {
+    "semantic_kitti": dict(id=0, vb=64, fov=(-24.8, 2.0)),
+    "nuscenes": dict(id=1, vb=32, fov=(-30.0, 10.0)),
+    "waymo": dict(id=2, vb=64, fov=(-17.6, 2.4)),
+}
+
 
 def index_operator(data_dict, index, duplicate=False):
     # index selection operator for keys in "index_valid_keys"
@@ -108,6 +114,20 @@ class Update(object):
     def __call__(self, data_dict):
         for key, value in self.keys_dict.items():
             data_dict[key] = value
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class AddLidarSensor(object):
+    def __init__(self, sensor=None, sensor_id=None):
+        assert sensor is not None or sensor_id is not None
+        if sensor_id is None:
+            assert sensor in LIDAR_SENSOR_CONFIGS, f"Unknown LiDAR sensor: {sensor}"
+            sensor_id = LIDAR_SENSOR_CONFIGS[sensor]["id"]
+        self.sensor_id = int(sensor_id)
+
+    def __call__(self, data_dict):
+        data_dict["lidar_sensor"] = np.array([self.sensor_id], dtype=np.int64)
         return data_dict
 
 
@@ -212,6 +232,50 @@ class PointClip(object):
                 a_max=self.point_cloud_range[3:],
             )
         return data_dict
+
+
+@TRANSFORMS.register_module()
+class BeamSubsample(object):
+    def __init__(
+        self,
+        sensor=None,
+        vb=None,
+        fov=None,
+        keep="even",
+        p=0.5,
+        vertical_endpoint=True,
+    ):
+        assert keep in ["even", "odd"]
+        if sensor is not None:
+            assert sensor in LIDAR_SENSOR_CONFIGS, f"Unknown LiDAR sensor: {sensor}"
+            sensor_cfg = LIDAR_SENSOR_CONFIGS[sensor]
+            vb = sensor_cfg["vb"] if vb is None else vb
+            fov = sensor_cfg["fov"] if fov is None else fov
+        assert vb is not None and fov is not None
+        self.vb = int(vb)
+        self.fov = tuple(float(v) for v in fov)
+        self.keep = keep
+        self.p = float(p)
+        self.vertical_endpoint = bool(vertical_endpoint)
+
+    def __call__(self, data_dict):
+        if random.random() > self.p:
+            return data_dict
+        coord = data_dict["coord"]
+        r_xy = np.linalg.norm(coord[:, :2], axis=1)
+        phi = np.degrees(np.arctan2(coord[:, 2], r_xy))
+        fov_min, fov_max = self.fov
+        denom = max(fov_max - fov_min, 1e-6)
+        if self.vertical_endpoint:
+            beam = np.rint((phi - fov_min) / denom * max(self.vb - 1, 1))
+        else:
+            beam = np.floor((phi - fov_min) / denom * self.vb)
+        beam = np.clip(beam.astype(np.int64), 0, self.vb - 1)
+        remainder = 0 if self.keep == "even" else 1
+        index = np.where(beam % 2 == remainder)[0]
+        if index.shape[0] == 0:
+            return data_dict
+        return index_operator(data_dict, index)
 
 
 @TRANSFORMS.register_module()

@@ -205,12 +205,81 @@ def regroup_batch(batch, N, original_offsets, data_keys):
     return new_batch, new_offsets, new_batch_imgs, new_batch_img_num
 
 
+def _z_rotation_matrix(angle, dtype, device):
+    cos = torch.cos(angle)
+    sin = torch.sin(angle)
+    return torch.stack(
+        [
+            torch.stack([cos, -sin, torch.zeros((), dtype=dtype, device=device)]),
+            torch.stack([sin, cos, torch.zeros((), dtype=dtype, device=device)]),
+            torch.stack(
+                [
+                    torch.zeros((), dtype=dtype, device=device),
+                    torch.zeros((), dtype=dtype, device=device),
+                    torch.ones((), dtype=dtype, device=device),
+                ]
+            ),
+        ]
+    )
+
+
+def apply_ddfe_enhanced_mix3d(batch, translate_x=(-25.0, 25.0), rotate_z=(-30.0, 30.0)):
+    if "coord" not in batch or "offset" not in batch or batch["offset"].numel() < 2:
+        return batch
+    coord = batch["coord"]
+    device = coord.device
+    dtype = coord.dtype
+    if "density_origin" not in batch:
+        batch["density_origin"] = torch.zeros_like(coord)
+
+    starts = torch.cat(
+        [torch.zeros(1, dtype=batch["offset"].dtype, device=device), batch["offset"][:-1]]
+    )
+    ends = batch["offset"]
+    for sample_idx in range(1, int(ends.numel()), 2):
+        start = int(starts[sample_idx].item())
+        end = int(ends[sample_idx].item())
+        if end <= start:
+            continue
+        angle1 = (
+            torch.empty((), dtype=dtype, device=device).uniform_(*rotate_z)
+            * torch.pi
+            / 180.0
+        )
+        angle2 = (
+            torch.empty((), dtype=dtype, device=device).uniform_(*rotate_z)
+            * torch.pi
+            / 180.0
+        )
+        trans_x = torch.empty((), dtype=dtype, device=device).uniform_(*translate_x)
+        translation = torch.stack(
+            [
+                trans_x,
+                torch.zeros((), dtype=dtype, device=device),
+                torch.zeros((), dtype=dtype, device=device),
+            ]
+        )
+        rot1 = _z_rotation_matrix(angle1, dtype, device)
+        rot2 = _z_rotation_matrix(angle2, dtype, device)
+        batch["coord"][start:end] = (coord[start:end] @ rot1.T + translation) @ rot2.T
+        batch["density_origin"][start:end] = translation @ rot2.T
+        if "normal" in batch:
+            batch["normal"][start:end] = (batch["normal"][start:end] @ rot1.T) @ rot2.T
+    return batch
+
+
 def point_collate_fn(batch, mix_prob=0):
     assert isinstance(
         batch[0], Mapping
     )  # currently, only support input_dict, rather than input_list
     batch = collate_fn(batch)
     if random.random() < mix_prob:
+        use_ddfe_mix3d = "ddfe_mix3d" in batch and bool(
+            batch["ddfe_mix3d"].view(-1)[0].item()
+        )
+        original_num_samples = int(batch["offset"].numel()) if "offset" in batch else 0
+        if use_ddfe_mix3d:
+            batch = apply_ddfe_enhanced_mix3d(batch)
         valid_keys = [
             "coord",
             "grid_coord",
@@ -218,6 +287,7 @@ def point_collate_fn(batch, mix_prob=0):
             "color",
             "normal",
             "feat",
+            "density_origin",
             "correspondence",
         ]
         if "instance" in batch.keys():
@@ -237,6 +307,26 @@ def point_collate_fn(batch, mix_prob=0):
                 [batch[offset_asset][1:-1:2], batch[offset_asset][-1].unsqueeze(0)],
                 dim=0,
             )
+        if use_ddfe_mix3d and original_num_samples > 0:
+            pair_index = torch.arange(
+                0, original_num_samples - 1, 2, device=batch["offset"].device
+            )
+            if original_num_samples % 2 == 1:
+                pair_index = torch.cat(
+                    [
+                        pair_index,
+                        torch.tensor(
+                            [original_num_samples - 1],
+                            dtype=pair_index.dtype,
+                            device=pair_index.device,
+                        ),
+                    ]
+                )
+            for sample_key in ["lidar_sensor", "grid_size", "ddfe_mix3d"]:
+                if sample_key in batch and batch[sample_key].shape[0] == original_num_samples:
+                    batch[sample_key] = batch[sample_key][
+                        pair_index.to(batch[sample_key].device)
+                    ]
 
         # Recompute grid_coord after mixing, because each scene's grid_coord was
         # independently shifted before mixing and is no longer consistent with
@@ -248,6 +338,8 @@ def point_collate_fn(batch, mix_prob=0):
             grid_coord = torch.floor(scaled_coord).to(torch.int64)
             min_coord, _ = scatter_min(grid_coord, batch_idx, dim=0)
             batch["grid_coord"] = grid_coord - min_coord[batch_idx]
+            if "displacement" in batch:
+                batch["displacement"] = scaled_coord - grid_coord - 0.5
         offset_assets = [asset for asset in batch.keys() if "_offset" in asset]
         for offset_asset in offset_assets:
             offset_prefix = offset_asset.split("_")[0]
